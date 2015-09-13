@@ -107,8 +107,8 @@
 
 #define	NO_NOTE		12
 
-#define	GRADIENT_MVG_AVE_CNT		4
-#define GRADIENT_MVG_AVE_MASK		0x03
+#define	GRADIENT_MVG_AVE_CNT		8
+#define GRADIENT_MVG_AVE_MASK		0x07
 
 /*----------------------------------------------------------------------------*/
 //
@@ -133,9 +133,7 @@ static uint8_t		midiEvent[MIDI_BUF_MAX][3];
 static int			midiEventReadPointer;
 static int			midiEventWritePointer;
 
-static bool			nowPlaying;
 static uint8_t		crntNote;
-static uint8_t		lastMod, lastPrt;
 static uint8_t		midiExp;
 static int			doremi;
 
@@ -147,11 +145,15 @@ static uint16_t		timerStock;
 static uint8_t		tmr2Cnt;
 
 static signed short	gravity[3];
+static signed short	shake[3];
 static int			shakeCount;
-static uint8_t		stockVel;
+static int			zaxisStateMachine;
+static signed short zaxisMaxStock;
+static bool			xaxisDirection;
 static signed short gradientMvgAve[GRADIENT_MVG_AVE_CNT];
 static int			mvgAveCounter;
 
+static int			kofCounter;
 static int			dbgCounter;
 
 static int			i2cComErr;
@@ -215,21 +217,27 @@ void initCommon( void )
     smbWritePtr = 0;
     runningStatus = 0x00;
 
-	nowPlaying = false;
 	crntNote = 0;
 	doremi = NO_NOTE;
-	lastMod = 0;
-	lastPrt = 0;
+
 	i2cComErr = 0;
     usbEnable = true;
 
 	int	i;
-	for (i=0;i<3;i++){ gravity[i] = 0;}
+	for (i=0;i<3;i++){
+		gravity[i] = 0;
+		shake[i] = 0;
+	}
 	for (i=0;i<GRADIENT_MVG_AVE_CNT;i++){ gradientMvgAve[i] = 0;}
-	shakeCount = 0;
-	stockVel = 0;
-	dbgCounter = 0;
 	mvgAveCounter = 0;
+
+	shakeCount = 0;
+	zaxisStateMachine = 0;
+	zaxisMaxStock = 0;
+	xaxisDirection = true;
+
+	kofCounter = 0;
+	dbgCounter = 0;
 
 	//AnalyseTouch_init();
 }
@@ -495,9 +503,8 @@ void testNoteEvent( void )
 /*----------------------------------------------------------------------------*/
 #define		LPF_COEF		205		//	205/256 = 0.8
 /*----------------------------------------------------------------------------*/
-uint8_t detectShaking( signed short* acl )
+void detectShaking( signed short* acl )
 {
-	signed short shake[3], shake_sqr[3];
 	int		i;
 	
 	//	remove a gravity ingredient from acceleration
@@ -506,85 +513,138 @@ uint8_t detectShaking( signed short* acl )
 		if ( acl[i] >= 64 ){ acl[i] -= 128; }
 		gravity[i] = (LPF_COEF*gravity[i] + (256-LPF_COEF)*acl[i])/256;
 		shake[i] = acl[i] - gravity[i];
-		shake_sqr[i] = shake[i]*shake[i];
 	}
-//	gradientMvgAve[mvgAveCounter++] = gravity[0];	//	stock only x axis
-//	mvgAveCounter &= GRADIENT_MVG_AVE_MASK;
-	
-	//	make the intensity of shaking
-	signed long	intens = shake_sqr[0] + shake_sqr[1] + shake_sqr[2];
-	uint8_t		vel;
-	//	square root value by linear interporation
-	if ( intens > 0x800 ){ vel = 127; }
-	else if ( intens > 0x300 ){ vel = 64 + (intens-0x300)/20;}		// 64 - 127
-	else if ( intens > 0x100 ){ vel = 1 + (intens-0x100)/8;}		// 1 - 64
-	else { vel = 0; }
-
-	//	Debug
-	dbgCounter++;
-	if (( vel > 0 ) || ( dbgCounter > 50 )){
-		for ( i=0; i<3; i++){
-			setMidiBuffer(0xb0,0x50+i,(uint8_t)(shake[i]+64));
-		}
-		dbgCounter = 0;
-	}	
-	
-	return vel;
+	gradientMvgAve[mvgAveCounter++] = acl[0];	//	stock only x axis
+	mvgAveCounter &= GRADIENT_MVG_AVE_MASK;
 }
-
 /*----------------------------------------------------------------------------*/
 //
 //      Generate MIDI by shaking
 //
 /*----------------------------------------------------------------------------*/
-#define		SHAKE_CNT		5
-#define		KEY_OFF_CNT		10
-#define		DEAD_BAND_CNT	16
-#define		DIRECTION_OFS	8
-/*----------------------------------------------------------------------------*/
-void generateShakeMidi( uint8_t vel )
+const uint8_t tCnvAccelToVel[128] = 
 {
-	//	manage shake state by "shakeCount"
-	//		1-3:		Wait Big Intense
-	//		10:		Key off
-	//		4-20:	Dead band
+	0,	1,	1,	1,	1,	1,	1,	1,	1,	1,
+	1,	1,	1,	1,	1,	1,	1,	1,	1,	1,
+	2,	4,	6,	8,	10,	12,	14,	16,	18,	20,
+	22,	24,	26,	28,	30,	32,	34,	36,	38,	40,
+	42,	44,	46,	48,	50,	52,	54,	56,	58,	60,
+	62,	64,	66,	68,	71,	74,	77,	80,	83,	86,
+	88,	90,	92,	94,	96,	98,	100,	102,	104,	106,
+	108,	110,	112,	114,	116,	118,	120,	122,	124,	126,
+	127,127,127,127,127,127,127,127,127,127,
+	127,127,127,127,127,127,127,127,127,127,
+	127,127,127,127,127,127,127,127,127,127,
+	127,127,127,127,127,127,127,127,127,127,
+	127,127,127,127,127,127,127,127
+};
+/*----------------------------------------------------------------------------*/
+void keyOnByShaking(void)
+{
+	uint8_t vel;
 
-	//	Increment Counter
-	if ( shakeCount ){ shakeCount++; }
+	if ( xaxisDirection == true ){ crntNote = 0x3a; }
+	else { crntNote = 0x37;}
+
+	if ( zaxisMaxStock < 0 ){ vel = 0; }
+	else {
+		vel = zaxisMaxStock;
+		if ( vel > 127 ) vel = 127;
+	}
+	setMidiBuffer(0x99,crntNote,tCnvAccelToVel[vel]);
+	doremi = crntNote%12;
+	midiExp = vel;
+}
+/*----------------------------------------------------------------------------*/
+void keyOffByShaking(void)
+{
+	setMidiBuffer(0x99,crntNote,0);
+	doremi = NO_NOTE;
+	midiExp = 0;	
+}
+/*----------------------------------------------------------------------------*/
+#define		FT_LVL					(-10)
+#define		MIN_MA_LVL				10
+#define		RETURN_TIME_FROM_INV	8	//	*10msec
+#define		RETURN_TIME_FROM_MA		6	//	*10msec
+#define		KEY_OFF_CNT				10	//	*10msec
+/*----------------------------------------------------------------------------*/
+void generateZaxisMIDI( void )
+{
+	switch( zaxisStateMachine ){
+		default:
+		case 0:
+			if ( shake[2] < FT_LVL ){
+				zaxisStateMachine = 1;
+				shakeCount = 0;
+				
+				signed short grv = 0;
+				for ( int i=0; i<GRADIENT_MVG_AVE_CNT; i++){
+					grv += gradientMvgAve[i];
+				}
+				if ( grv >= 30 ){ xaxisDirection = true;}
+				else { xaxisDirection = false;}
+			}
+			break;
+		case 1:
+			//	check time-up
+			if ( shakeCount > RETURN_TIME_FROM_INV ){
+				zaxisStateMachine = 0;
+			}
+			shakeCount++;
+
+			if ( shake[2] > 0 ){
+				//	Invert
+				zaxisStateMachine = 2;
+				zaxisMaxStock = 0;
+				shakeCount = 0;
+			}
+			break;
+		case 2:
+			if ( shake[2] < 0 ){
+				zaxisStateMachine = 0;
+			}
+			//	Check time-up
+			if ( shakeCount > RETURN_TIME_FROM_MA ){
+				zaxisStateMachine = 0;				
+			}
+			shakeCount++;
+
+			if ( zaxisMaxStock < shake[2] ){
+				//	Update Max Value
+				zaxisMaxStock = shake[2];
+			}
+			else {
+				if ( zaxisMaxStock > MIN_MA_LVL ){
+					//	KeyOn
+					if ( kofCounter ){
+						keyOffByShaking();
+					}
+					keyOnByShaking();
+					shakeCount = 0;
+					kofCounter = KEY_OFF_CNT;
+				}
+				zaxisStateMachine = 0;
+				zaxisMaxStock = 0;
+			}
+			break;
+	}
+
+	//	Generate Key Off
+	if ( kofCounter ){
+		kofCounter--;
+		if ( !kofCounter ){
+			keyOffByShaking();
+		}
+	}
 	
-	if ( shakeCount == 0 ){
-		if ( vel > 0 ){	//	start count
-			crntNote = 0x2a;
-			//	Calculate Moving Average
-			signed short gradient = gravity[0];
-		//	int	i;
-		//	for (i=0;i<GRADIENT_MVG_AVE_CNT;i++){ gradient += gradientMvgAve[i]; }
-		//	gradient /= GRADIENT_MVG_AVE_CNT;
-			if ( gradient > DIRECTION_OFS ){ crntNote = 0x31; }
-			else if ( gradient < -DIRECTION_OFS ){ crntNote = 0x25; }
-			stockVel = vel;
-			shakeCount = 1;
+	//	Debug
+	dbgCounter++;
+	if (( zaxisStateMachine > 0 ) || ( dbgCounter > 50 )){	//	once 500msec
+		for (int i=0;i<3;i++){
+			setMidiBuffer(0xb0,0x50+i,(uint8_t)(shake[i]+64));
 		}
-	}
-	else if (( shakeCount >= 1 ) && ( shakeCount <= SHAKE_CNT )){
-		if ( stockVel < vel ){ stockVel = vel;}
-		
-		if ( shakeCount == SHAKE_CNT ){
-			setMidiBuffer(0x99,crntNote,stockVel);
-			doremi = crntNote%12;
-			midiExp = stockVel;
-			stockVel = 0;
-		}
-	}
-	else if ( shakeCount > SHAKE_CNT ){
-		if ( shakeCount == KEY_OFF_CNT ){
-			setMidiBuffer(0x99,crntNote,0);
-			doremi = NO_NOTE;
-			midiExp = 0;
-		}
-		else if ( shakeCount >= DEAD_BAND_CNT ){
-			shakeCount = 0;
-		}
+		dbgCounter = 0;
 	}
 }
 /*----------------------------------------------------------------------------*/
@@ -604,8 +664,8 @@ void acceleratorSensor( void )
 	if ( err != 0 ) i2cComErr = err + 40;
 
 	//	Analyse & Generate MIDI
-	uint8_t vel = detectShaking( acl );
-	generateShakeMidi( vel );
+	detectShaking( acl );
+	generateZaxisMIDI();
 }
 #endif
 /*----------------------------------------------------------------------------*/
