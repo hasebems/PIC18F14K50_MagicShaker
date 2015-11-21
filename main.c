@@ -110,6 +110,20 @@
 #define	GRADIENT_MVG_AVE_CNT		8
 #define GRADIENT_MVG_AVE_MASK		0x07
 
+typedef enum {
+	DETECT_SHAKING,	//	Accelerator to detect shaking
+	DETECT_INCLINE,	//	Accelerator to detect incline
+	MAX_DETECT
+} ACCEL_TYPE;
+
+typedef enum {
+	FT_WAIT,
+	INV_WAIT,
+	MA_WAIT,
+	STATE_MAX
+} SHAKE_STATE_MACHINE;
+
+
 /*----------------------------------------------------------------------------*/
 //
 //      Variables
@@ -144,14 +158,12 @@ static bool			event100msec;
 static uint16_t		timerStock;
 static uint8_t		tmr2Cnt;
 
-static signed short	gravity[3];
-static signed short	shake[3];
-static int			shakeCount;
-static int			zaxisStateMachine;
-static signed short zaxisMaxStock;
-static bool			xaxisDirection;
-static signed short gradientMvgAve[GRADIENT_MVG_AVE_CNT];
-static int			mvgAveCounter;
+static signed long			gravity[MAX_DETECT][3];
+static signed short			shake[3];
+static int					shakeCount;
+static SHAKE_STATE_MACHINE	zaxisStateMachine;
+static signed short			zaxisMaxStock;
+static signed short			debugOld[3];
 
 static int			kofCounter;
 static int			dbgCounter;
@@ -225,16 +237,15 @@ void initCommon( void )
 
 	int	i;
 	for (i=0;i<3;i++){
-		gravity[i] = 0;
+		gravity[DETECT_SHAKING][i] = 0;
+		gravity[DETECT_INCLINE][i] = 0;
 		shake[i] = 0;
+		debugOld[i] = 0;
 	}
-	for (i=0;i<GRADIENT_MVG_AVE_CNT;i++){ gradientMvgAve[i] = 0;}
-	mvgAveCounter = 0;
 
 	shakeCount = 0;
-	zaxisStateMachine = 0;
+	zaxisStateMachine = FT_WAIT;
 	zaxisMaxStock = 0;
-	xaxisDirection = true;
 
 	kofCounter = 0;
 	dbgCounter = 0;
@@ -255,7 +266,8 @@ void initAllI2cHw( void )
 	MPR121_init();
 #endif
 #if USE_I2C_ACCELERATOR_SENSOR
-	ADXL345_init();
+	ADXL345_init(DETECT_SHAKING);
+	ADXL345_init(DETECT_INCLINE);
 #endif
 }
 
@@ -498,25 +510,29 @@ void testNoteEvent( void )
 #if USE_I2C_ACCELERATOR_SENSOR
 /*----------------------------------------------------------------------------*/
 //
-//      Detect shaking
+//      Detect shaking / incline
 //
 /*----------------------------------------------------------------------------*/
-#define		LPF_COEF		205		//	205/256 = 0.8
+#define		LPF_COEF		230		//	230/256 = 0.9
 /*----------------------------------------------------------------------------*/
-void detectShaking( signed short* acl )
+void analyseAccelValue( ACCEL_TYPE tp, signed short* acl )
 {
 	int		i;
+	signed long tmp;
 	
 	//	remove a gravity ingredient from acceleration
 	for ( i=0; i<3; i++){
-		acl[i] /= 512;
-		if ( acl[i] >= 64 ){ acl[i] -= 128; }
-		gravity[i] = (LPF_COEF*gravity[i] + (256-LPF_COEF)*acl[i])/256;
-		shake[i] = acl[i] - gravity[i];
+		tmp = (signed long)acl[i];
+		if ( tmp > 32768 ) tmp -= 65536;	//	-32768 - +32767
+		gravity[tp][i] = (LPF_COEF*gravity[tp][i] + (256-LPF_COEF)*tmp)/256;
+		if ( tp == DETECT_SHAKING ){
+			signed long shk = acl[i] - gravity[tp][i];
+			shk /= 512;
+			shake[i] = shk;
+		}
 	}
-	gradientMvgAve[mvgAveCounter++] = acl[0];	//	stock only x axis
-	mvgAveCounter &= GRADIENT_MVG_AVE_MASK;
 }
+
 /*----------------------------------------------------------------------------*/
 //
 //      Generate MIDI by shaking
@@ -543,15 +559,19 @@ void keyOnByShaking(void)
 {
 	uint8_t vel;
 
-	if ( xaxisDirection == true ){ crntNote = 0x3a; }
-	else { crntNote = 0x37;}
-
-	if ( zaxisMaxStock < 0 ){ vel = 0; }
+	if ( gravity[DETECT_INCLINE][0] > 0 ){
+		crntNote = 0x3a;
+	}
+	else {
+		crntNote = 0x37;
+	}
+	
+	if ( zaxisMaxStock <= 0 ){ vel = 1; }
 	else {
 		vel = zaxisMaxStock;
 		if ( vel > 127 ) vel = 127;
 	}
-	setMidiBuffer(0x99,crntNote,tCnvAccelToVel[vel]);
+	setMidiBuffer(0x99,crntNote,vel/*tCnvAccelToVel[vel]*/);
 	doremi = crntNote%12;
 	midiExp = vel;
 }
@@ -565,57 +585,56 @@ void keyOffByShaking(void)
 /*----------------------------------------------------------------------------*/
 #define		FT_LVL					(-10)
 #define		MIN_MA_LVL				10
-#define		RETURN_TIME_FROM_INV	8	//	*10msec
-#define		RETURN_TIME_FROM_MA		6	//	*10msec
+#define		INV_TIME				12	//	*10msec
+#define		MA_TIME					10	//	*10msec
 #define		KEY_OFF_CNT				10	//	*10msec
 /*----------------------------------------------------------------------------*/
 void generateZaxisMIDI( void )
 {
-	switch( zaxisStateMachine ){
+	signed short shk = shake[2];	//	z-axis
+	signed short* maxStock = &zaxisMaxStock;
+	SHAKE_STATE_MACHINE* stateMachine = &zaxisStateMachine;
+
+	switch( *stateMachine ){
 		default:
-		case 0:
-			if ( shake[2] < FT_LVL ){
-				zaxisStateMachine = 1;
+		case FT_WAIT:
+			if ( shk < FT_LVL ){
+				*stateMachine = INV_WAIT;
 				shakeCount = 0;
-				
-				signed short grv = 0;
-				for ( int i=0; i<GRADIENT_MVG_AVE_CNT; i++){
-					grv += gradientMvgAve[i];
-				}
-				if ( grv >= 30 ){ xaxisDirection = true;}
-				else { xaxisDirection = false;}
 			}
 			break;
-		case 1:
+
+		case INV_WAIT:
 			//	check time-up
-			if ( shakeCount > RETURN_TIME_FROM_INV ){
-				zaxisStateMachine = 0;
+			if ( shakeCount > INV_TIME ){
+				*stateMachine = FT_WAIT;
 			}
 			shakeCount++;
 
-			if ( shake[2] > 0 ){
+			if ( shk > 0 ){
 				//	Invert
-				zaxisStateMachine = 2;
-				zaxisMaxStock = 0;
+				*stateMachine = MA_WAIT;
+				*maxStock = 0;
 				shakeCount = 0;
 			}
 			break;
-		case 2:
-			if ( shake[2] < 0 ){
-				zaxisStateMachine = 0;
+
+		case MA_WAIT:
+			if ( shk < 0 ){
+				*stateMachine = FT_WAIT;
 			}
 			//	Check time-up
-			if ( shakeCount > RETURN_TIME_FROM_MA ){
-				zaxisStateMachine = 0;				
+			if ( shakeCount > MA_TIME ){
+				*stateMachine = FT_WAIT;				
 			}
 			shakeCount++;
 
-			if ( zaxisMaxStock < shake[2] ){
+			if ( *maxStock < shk ){
 				//	Update Max Value
-				zaxisMaxStock = shake[2];
+				*maxStock = shk;
 			}
 			else {
-				if ( zaxisMaxStock > MIN_MA_LVL ){
+				if ( *maxStock > MIN_MA_LVL ){
 					//	KeyOn
 					if ( kofCounter ){
 						keyOffByShaking();
@@ -624,8 +643,8 @@ void generateZaxisMIDI( void )
 					shakeCount = 0;
 					kofCounter = KEY_OFF_CNT;
 				}
-				zaxisStateMachine = 0;
-				zaxisMaxStock = 0;
+				*stateMachine = FT_WAIT;
+				*maxStock = 0;
 			}
 			break;
 	}
@@ -637,15 +656,6 @@ void generateZaxisMIDI( void )
 			keyOffByShaking();
 		}
 	}
-	
-	//	Debug
-	dbgCounter++;
-	if (( zaxisStateMachine > 0 ) || ( dbgCounter > 50 )){	//	once 500msec
-		for (int i=0;i<3;i++){
-			setMidiBuffer(0xb0,0x50+i,(uint8_t)(shake[i]+64));
-		}
-		dbgCounter = 0;
-	}
 }
 /*----------------------------------------------------------------------------*/
 //
@@ -654,18 +664,46 @@ void generateZaxisMIDI( void )
 /*----------------------------------------------------------------------------*/
 void acceleratorSensor( void )
 {
-	signed short acl[3] = { 0,0,0 };
+	signed short aclShake[3] = {0,0,0};
+	signed short aclIncline[3] = {0,0,0};
 	int		err, i;
 
 	//	once 10msec
 	if ( event10msec == false ) return;
 
-	err = ADXL345_getAccel(acl);
-	if ( err != 0 ) i2cComErr = err + 40;
+	err = ADXL345_getAccel(0,aclShake);
+	if ( err != 0 ) i2cComErr = err;
 
+	err = ADXL345_getAccel(1,aclIncline);
+	if ( err != 0 ) i2cComErr = err + 40;
+	
 	//	Analyse & Generate MIDI
-	detectShaking( acl );
+	analyseAccelValue( DETECT_SHAKING, aclShake );
+	analyseAccelValue( DETECT_INCLINE, aclIncline );
 	generateZaxisMIDI();
+
+	//	for debug
+#if 0	//	observe one sensor's x,y,z-axis
+	for (int i=0;i<3;i++){
+		signed long dbgDt = gravity[DETECT_SHAKING][i]/256;
+		if ( dbgDt != debugOld[i] ){
+			setMidiBuffer(0xb0,0x50+i,(uint8_t)(dbgDt+64));
+			debugOld[i] = dbgDt;
+		}
+	}
+#endif	
+#if 1	//	observe two sensor's z-axis
+	signed long dbgDt = gravity[DETECT_SHAKING][2]/256;
+	if ( dbgDt != debugOld[0] ){
+		setMidiBuffer(0xb0,0x50,(uint8_t)(dbgDt+64));
+		debugOld[0] = dbgDt;
+	}
+	signed long dbgDt2 = gravity[DETECT_INCLINE][2]/256;
+	if ( dbgDt2 != debugOld[1] ){
+		setMidiBuffer(0xb0,0x51,(uint8_t)(dbgDt2+64));
+		debugOld[1] = dbgDt2;
+	}
+#endif
 }
 #endif
 /*----------------------------------------------------------------------------*/

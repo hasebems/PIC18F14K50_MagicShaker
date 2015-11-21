@@ -22,15 +22,12 @@ int LPS331AP_getPressure( int* retPrs );
 void MPR121_init( void );
 int MPR121_getTchSwData( unsigned char* retSw );
 
-void ADXL345_init( void );
-int ADXL345_getAccel( signed short* value );
+void ADXL345_init( unsigned char chipnum );
+int ADXL345_getAccel( unsigned char chipnum, signed short* value );
 
 void ADS1015_init( void );
 void ADS1015_setNext( int adNum );
 int ADS1015_getVolume( unsigned char* reg );
-
-void BlinkM_init( void );
-int BlinkM_changeColor( unsigned char note );
 
 #ifdef	__cplusplus
 }

@@ -22,6 +22,7 @@ static const unsigned char LED_BLINKM_ADDRESS = 0x09;
 static const unsigned char ADC_ADDRESS = 0x48;
 //static const unsigned char LED_ADA88_ADDRESS = 0x70;
 static const unsigned char ACCEL_SENSOR_ADDRESS = 0x1d;
+static const unsigned char ACCEL_SENSOR_ADDRESS2 = 0x53;
 
 // I2C Bus Control Definition
 #define I2C_WRITE_CMD 0
@@ -452,21 +453,27 @@ int MPR121_getTchSwData( unsigned char* retSw )
 #define ACCEL_SNCR_PWR_CTRL			0x2d
 #define ACCEL_SNCR_DATA_FORMAT		0x31
 //-------------------------------------------------------------------------
-void ADXL345_init( void )
+void ADXL345_init( unsigned char chipnum )
 {
+	unsigned char i2cadrs = ACCEL_SENSOR_ADDRESS;
+	if ( chipnum == 1 ){ i2cadrs = ACCEL_SENSOR_ADDRESS2; }
+
 	//	Start Access
-	writeI2cWithCmd(ACCEL_SENSOR_ADDRESS,ACCEL_SNCR_RATE,0x0b);				//	200Hz (5msec)
-	writeI2cWithCmd(ACCEL_SENSOR_ADDRESS,ACCEL_SNCR_PWR_CTRL,0x08);			//	Start Measurement
-	writeI2cWithCmd(ACCEL_SENSOR_ADDRESS,ACCEL_SNCR_DATA_FORMAT,0x05);		//	Left Justified, 4g
+	writeI2cWithCmd(i2cadrs,ACCEL_SNCR_RATE,0x0b);				//	200Hz (5msec)
+	writeI2cWithCmd(i2cadrs,ACCEL_SNCR_PWR_CTRL,0x08);			//	Start Measurement
+	writeI2cWithCmd(i2cadrs,ACCEL_SNCR_DATA_FORMAT,0x05);		//	Left Justified, 4g
 }
 //-------------------------------------------------------------------------
-int ADXL345_getAccel( signed short* value )
+int ADXL345_getAccel( unsigned char chipnum, signed short* value )
 {
 	unsigned short tmp;
 	unsigned char reg[2];
+	unsigned char i2cadrs = ACCEL_SENSOR_ADDRESS;
 	int err;
 
-	err = readI2cWithCmd(ACCEL_SENSOR_ADDRESS,0x32,reg,2);
+	if ( chipnum == 1 ){ i2cadrs = ACCEL_SENSOR_ADDRESS2; }
+	
+	err = readI2cWithCmd(i2cadrs,0x32,reg,2);
 	if (!err){
 		tmp = reg[0];
 		tmp |= reg[1] << 8;
@@ -474,7 +481,7 @@ int ADXL345_getAccel( signed short* value )
 	}
 	else return err;
 
-	err = readI2cWithCmd(ACCEL_SENSOR_ADDRESS,0x34,reg,2);
+	err = readI2cWithCmd(i2cadrs,0x34,reg,2);
 	if (!err){
 		tmp = reg[0];
 		tmp |= reg[1] << 8;
@@ -482,7 +489,7 @@ int ADXL345_getAccel( signed short* value )
 	}
 	else return err;
 
-	err = readI2cWithCmd(ACCEL_SENSOR_ADDRESS,0x36,reg,2);
+	err = readI2cWithCmd(i2cadrs,0x36,reg,2);
 	if (!err){
 		tmp = reg[0];
 		tmp |= reg[1] << 8;
@@ -519,38 +526,3 @@ int ADS1015_getVolume( unsigned char* reg )
 }
 #endif
 
-//-------------------------------------------------------------------------
-//			BlinkM ( Full Color LED : I2c Device)
-//-------------------------------------------------------------------------
-#if USE_I2C_BLINKM
-void BlinkM_init( void )
-{
-	unsigned char color[3] = {0x00,0x00,0x00};
-
-	writeI2cWithCmd( LED_BLINKM_ADDRESS, 'o', 0 );
-	writeI2cWithCmd( LED_BLINKM_ADDRESS, 'f', 80 );
-	writeI2cWithCmdAndMultiData( LED_BLINKM_ADDRESS, 'n', color, 3 );
-}
-//-------------------------------------------------------------------------
-const unsigned char tNoteToColor[13][3] = {
-	//	R	  G		B
-	{ 0xff, 0x00, 0x00 },
-	{ 0xe0, 0x20, 0x00 },
-	{ 0xc0, 0x40, 0x00 },
-	{ 0xa0, 0x60, 0x00 },
-	{ 0x80, 0x80, 0x00 },
-	{ 0x00, 0xff, 0x00 },
-	{ 0x00, 0x80, 0x80 },
-	{ 0x00, 0x00, 0xff },
-	{ 0x20, 0x00, 0xe0 },
-	{ 0x40, 0x00, 0xc0 },
-	{ 0x60, 0x00, 0xa0 },
-	{ 0x80, 0x00, 0x80 },
-	{ 0x00, 0x00, 0x00 }
-};
-//-------------------------------------------------------------------------
-int BlinkM_changeColor( unsigned char note )
-{
-	return writeI2cWithCmdAndMultiData( LED_BLINKM_ADDRESS, 'c', (unsigned char*)tNoteToColor[note], 3 );
-}
-#endif
